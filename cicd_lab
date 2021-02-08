@@ -1,0 +1,269 @@
+AWSTemplateFormatVersion: 2010-09-09
+Description: 'Getting Started with DevOps on AWS'
+
+Parameters:
+  LatestLinuxAmiId:
+    Type: 'AWS::SSM::Parameter::Value<AWS::EC2::Image::Id>'
+    Default: '/aws/service/ami-amazon-linux-latest/amzn2-ami-hvm-x86_64-gp2'
+  instanceType:
+    Type: String
+    Default: t3.micro
+    AllowedValues:
+      - t3.micro
+      - t3.small
+  environment:
+    Type: String
+    Default: app
+
+Resources:
+  ##Web Application Network Environment
+  vpc:
+    Type: AWS::EC2::VPC
+    Properties:
+      CidrBlock: 10.0.0.0/21
+      EnableDnsSupport: true
+      EnableDnsHostnames: true
+      Tags:
+        - Key: Name
+          Value: !Sub ${environment}-vpc
+  pubSubnetA:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: True
+      AvailabilityZone: 
+        Fn::Select:
+          - 0
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref vpc
+      CidrBlock: 10.0.0.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub ${environment}-Pub-a
+  pubSubnetB:
+    Type: AWS::EC2::Subnet
+    Properties:
+      MapPublicIpOnLaunch: True
+      AvailabilityZone: 
+        Fn::Select:
+          - 1
+          - Fn::GetAZs: !Ref 'AWS::Region'
+      VpcId: !Ref vpc
+      CidrBlock: 10.0.1.0/24
+      Tags:
+        - Key: Name
+          Value: !Sub ${environment}-Pub-b
+  igw:
+    Type: AWS::EC2::InternetGateway
+    Properties:
+      Tags:
+        - Key: Name
+          Value: Lab-igw
+  AttachGateway:
+    Type: AWS::EC2::VPCGatewayAttachment
+    Properties:
+      VpcId: !Ref vpc
+      InternetGatewayId: !Ref igw
+  pubRt:
+    Type: AWS::EC2::RouteTable
+    Properties:
+      VpcId: !Ref vpc
+      Tags:
+        - Key: Name
+          Value:  !Sub ${environment}-public-RT
+  pubRtAssocA:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref pubSubnetA
+      RouteTableId: !Ref pubRt
+  pubRtAssocB:
+    Type: AWS::EC2::SubnetRouteTableAssociation
+    Properties:
+      SubnetId: !Ref pubSubnetB
+      RouteTableId: !Ref pubRt
+  igwRoute:
+    Type: AWS::EC2::Route
+    Properties:
+      RouteTableId: !Ref pubRt
+      DestinationCidrBlock: 0.0.0.0/0
+      GatewayId: !Ref igw
+
+  ##Environment Security Groups
+  lbSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: LoadBalancer Security Group
+      VpcId: !Ref vpc
+      SecurityGroupIngress:
+        - CidrIp: 0.0.0.0/0
+          IpProtocol: tcp
+          FromPort: 80
+          ToPort: 80
+          Description: Web Traffic from the internet
+      Tags:
+        - Key: Name
+          Value: !Sub ${environment}-lbSG
+  appSG:
+    Type: AWS::EC2::SecurityGroup
+    Properties:
+      GroupDescription: Web Application Security Group
+      VpcId: !Ref vpc
+      SecurityGroupIngress:
+        - SourceSecurityGroupId: !Ref lbSG
+          IpProtocol: tcp
+          ToPort: 80
+          FromPort: 80
+          Description: Web Traffic from the load balancer
+      Tags:
+        - Key: Name
+          Value: !Sub ${environment}-appSG
+  
+  ##Environment Application Load Balancer and Target Group
+  appALB:
+    Type: AWS::ElasticLoadBalancingV2::LoadBalancer
+    Properties:
+      Name: !Sub ${environment}-appALB
+      SecurityGroups:
+        - !Ref lbSG
+      Subnets:
+        - !Ref pubSubnetA
+        - !Ref pubSubnetB
+  targetGroup:
+    Type: AWS::ElasticLoadBalancingV2::TargetGroup
+    Properties:
+      Port: 80
+      Protocol: HTTP
+      VpcId: !Ref vpc
+      HealthyThresholdCount: 2
+      TargetGroupAttributes:
+        - Key: deregistration_delay.timeout_seconds
+          Value: "0"
+  albListener:
+      Type: 'AWS::ElasticLoadBalancingV2::Listener'
+      Properties:
+        DefaultActions:
+          - Type: forward
+            TargetGroupArn: !Ref targetGroup
+        LoadBalancerArn: !Ref appALB
+        Port: 80
+        Protocol: HTTP
+
+  ##Environment Autoscaling Group and Launch Template
+  webASG: 
+    Type: AWS::AutoScaling::AutoScalingGroup
+    DependsOn:
+      - pubRtAssocA
+      - pubRtAssocB
+    UpdatePolicy:
+      AutoScalingReplacingUpdate:
+        WillReplace: true
+    CreationPolicy:
+      ResourceSignal:
+        Timeout: PT5M
+        Count: 2
+    Properties:
+      AvailabilityZones: 
+        - Fn::Select:
+            - 0
+            - Fn::GetAZs: !Ref 'AWS::Region'
+        - Fn::Select:
+            - 1
+            - Fn::GetAZs: !Ref 'AWS::Region'
+      TargetGroupARNs:
+        - !Ref targetGroup
+      MaxSize: '2'
+      MinSize: '2'
+      HealthCheckType: ELB
+      HealthCheckGracePeriod: 30
+      LaunchTemplate:
+        LaunchTemplateId: !Ref appLaunchTemplate
+        Version: !GetAtt appLaunchTemplate.LatestVersionNumber
+      VPCZoneIdentifier: 
+        - !Ref pubSubnetA
+        - !Ref pubSubnetB
+      Tags: 
+        - Key: Name
+          Value: !Sub "${environment} Web Server"
+          PropagateAtLaunch: true
+  appLaunchTemplate:
+    Type: AWS::EC2::LaunchTemplate
+    Metadata:
+      AWS::CloudFormation::Init:
+        config:
+          packages:
+            yum:
+              httpd: []
+          services:
+            sysvinit:
+              httpd:
+                enabled: 'true'
+                ensureRunning: 'true'
+          files:
+            /var/www/html/index.html:
+              content: |
+                <!DOCTYPE html>
+                <html lang="en">
+                  <head>
+                    <meta charset="utf-8">
+                    <meta name="viewport" content="width=device-width, initial-scale=1, shrink-to-fit=no">
+                    <link rel="stylesheet" href="https://stackpath.bootstrapcdn.com/bootstrap/4.5.0/css/bootstrap.min.css" integrity="sha384-9aIt2nRpC12Uk9gS9baDl411NQApFmC26EwAOH8WgZl5MYYxFfc+NcPb1dKGj7Sk" crossorigin="anonymous">
+                    <title>Simple Web Application</title>
+                  </head>
+                  <body>
+                    <header style='background: #a13941;color: #e9ecef;'>
+                      <div class='container' style='padding: 20px;'>
+                        <h1>Web Application</h1>
+                      </div>
+                    </header>
+                    <section style='background: #e9ecef;'>
+                      <div class='container' style='background: #fff;padding: 20px;'>
+                        <p>Instance Type: {{instanceType}}</p> 
+                        <p>Instance Id: {{instanceId}}</p>
+                        <p>Region: {{region}}</p>
+                      </div>
+                    </section>
+                    <footer style="background: #a13941;color: #e9ecef;" >
+                      <div class="container"><small>Example Corp 2021</small></div>
+                    </footer>
+                  </body>
+                </html>
+              mode: '000600'
+              owner: apache
+              group: apache
+    Properties:
+      LaunchTemplateName: !Sub ${environment}-LT
+      LaunchTemplateData: 
+        ImageId: !Ref LatestLinuxAmiId
+        InstanceType: !Ref instanceType
+        SecurityGroupIds:
+          - !Ref appSG
+        UserData:
+          Fn::Base64: 
+            !Sub |
+              #!/bin/bash -xe
+              yum update -y aws-cfn-bootstrap
+
+              #get instance information from the metadata service
+              instanceType=$(curl http://169.254.169.254/latest/meta-data/instance-type)
+              region=$(curl http://169.254.169.254/latest/meta-data/placement/region)
+              instanceId=$(curl http://169.254.169.254/latest/meta-data/instance-id)
+              
+              # Install the files and packages from the metadata
+              /opt/aws/bin/cfn-init -v --stack ${AWS::StackName} --resource appLaunchTemplate --region ${AWS::Region}
+              exitCode=$?
+
+              #replace placeholder text with the variables above
+              sed -i "s/{{instanceType}}/$instanceType/g" /var/www/html/index.html
+              sed -i "s/{{instanceId}}/$instanceId/g" /var/www/html/index.html
+              sed -i "s/{{region}}/$region/g" /var/www/html/index.html\
+
+              ##Release notes
+              ## - initial release
+
+              ##End release notes
+
+              /opt/aws/bin/cfn-signal --e $exitCode --stack ${AWS::StackName} --resource webASG --region ${AWS::Region}
+
+Outputs:
+  ApplicationURL:
+    Description: DNS address that the application can be accessed
+    Value: !GetAtt appALB.DNSName
